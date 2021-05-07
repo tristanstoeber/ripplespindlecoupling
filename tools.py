@@ -1,60 +1,13 @@
-from scipy.signal import butter, lfilter
 import numpy as np
-from scipy.signal import cheby1, lfilter, hilbert, sosfilt
+from scipy.signal import cheby1, hilbert, sosfilt
 import ripple_detection as rd
 import pandas as pd
 import pdb
 from scipy.stats import zscore
 import glob
+import multiprocessing as mp
+from pyxona import File
 
-
-def butter_bandpass(lowcut, highcut, fs, order=5):
-    """ 
-    https://scipy-cookbook.readthedocs.io/items/ButterworthBandpass.html
-    """ 
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
-
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
-    """ 
-    https://scipy-cookbook.readthedocs.io/items/ButterworthBandpass.html
-    """ 
-
-    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    y = lfilter(b, a, data)
-    return y
-
-def cheby1_bandpass_filter(data, cheby1_params):
-    """
-    Chebyshev type I bandpass filter
-
-    Parameters
-    ----------
-    data : numpy.ndarray
-        signal
-    
-    lowcut : int
-        lower frequency edge in Hz
-    highcut : int
-        higher frequency edge in Hz
-    fs_data : int
-        sampling rate of data in Hz
-    order : int
-        order of filter
-    ripple : float
-        The maximum ripple allowed below unity gain in the passband. Specified in decibels, as a positive number.
-
-    Returns
-    -------
-    out : np.ndarray
-    """
-    
-    sos = cheby1(**cheby1_params)
-    data_filtrd = sosfilt(sos, data)
-    
 
 def segment_boolean_series(
         series,
@@ -134,8 +87,10 @@ def evnt_pos(evnts, time):
     pos = [(strt, stp) for strt, stp in  zip(pos_start, pos_stop)]
     return pos
 
+
 def get_evts_centers(evnts):
     return np.mean(evnts, axis=1)
+
 
 def event_detection(
         data,
@@ -148,7 +103,9 @@ def event_detection(
         dur_max,
         dur_merge,
         ampl_thresh,
-        return_info):
+        t_excl_edge,
+        return_info,
+        ):
 
     """
     Parameters
@@ -172,6 +129,8 @@ def event_detection(
         Minimal duration between events in seconds    
     ampl_thresh : float
         Amplitude threshold in standard deviation
+    t_excl_edge : float
+        Exclude events with centers closer to edge than t_excl_edge
     return_info : dict
         dict specifying return
         'evts_ts_strtstop' : bool
@@ -185,7 +144,6 @@ def event_detection(
            raw signal, in relation to center,
            if True within start stop
 
-
     Returns
     ----------
     df : pandas.DataFrame
@@ -196,7 +154,6 @@ def event_detection(
     t_stop = len(data)*sampling_interval
     t = np.arange(0, t_stop, sampling_interval)
     assert len(data) == len(t)
-
     # bandpass filter
     sos = cheby1(
         cheby1_ord,
@@ -206,17 +163,17 @@ def event_detection(
         fs=freq_sampl,
         output='sos')
     data_fltd = sosfilt(sos, data)
-    assert len(data)==len(data_fltd)
+    assert len(data) == len(data_fltd)
 
     # Determine magnitude
     data_hilbert = hilbert(data_fltd)
     data_envlp = np.abs(data_hilbert)
-    assert len(data)==len(data_envlp)    
+    assert len(data) == len(data_envlp)
 
     # standard deviation of magnitude
     data_zscore = zscore(data_envlp)
-    assert len(data)==len(data_zscore)
-    
+    assert len(data) == len(data_zscore)
+
     # find data points exceeding std
     evts_bool = data_zscore > ampl_thresh
 
@@ -227,8 +184,6 @@ def event_detection(
         minimum_duration=dur_min,
         maximum_duration=dur_max,
         merge_duration=dur_merge)
-
-    # TODO merge close events, repurpose rd.exclude_close_events
 
     # create return dataframe
     ret = {}
@@ -289,7 +244,12 @@ def event_detection(
         ret['evts_data_ts'] = ts_datapts
 
     df = pd.DataFrame.from_dict(ret)
-
+    # exclude events with centers too close to edge
+    if t_excl_edge:
+        bool_valid = np.logical_and(
+            df['evts_ts_center'] > t_excl_edge,
+            df['evts_ts_center'] < t_stop-t_excl_edge)
+        df = df[bool_valid].reset_index()
     return df
 
 
@@ -308,10 +268,10 @@ def generate_fileinfo(path, re=None, columnnames=None):
     """
 
     ls_fname = []
-    for fname in glob.glob(path):
+    for fname in glob.glob(path+'*.set'):
         ls_fname.append({'fname' : fname})
     
-        df = pd.DataFrame({'fname': glob.glob(path)})
+        df = pd.DataFrame({'fname': glob.glob(path+'*.set')})
 
     if not re:
         sub_id = '\w+'
@@ -338,3 +298,222 @@ def generate_fileinfo(path, re=None, columnnames=None):
 
     return df
 
+
+def load_notes(path, fname_notes):
+    df_notes = pd.read_excel(path+fname_notes, engine="odf")
+
+    # fill missing values
+    for c_name in ['animal', 'date', 'treatment']:
+        df_notes[c_name] = df_notes[c_name].fillna(method='ffill')
+
+    # rename animal header for consistency
+    df_notes = df_notes.rename(columns={'animal': 'id'})
+
+    # convert date and session to string for consistency
+    df_notes['date'] = df_notes['date'].astype(int).astype(str)
+    df_notes['session'] = df_notes['session'].astype(int).astype(str)
+
+    return df_notes
+
+
+def event_detection_mp(
+        df_info, params_ripples, params_spindles, verbose=False, concat_results=True):
+    """
+    event detection with multiprocessing
+    """
+    
+    results = {}
+        
+    pool = mp.Pool(mp.cpu_count()-1)
+
+    try:
+        for index, row in df_info.iterrows():
+            results[index] = pool.apply_async(
+                event_detection_wrapper,
+                args=(row, params_ripples, params_spindles, verbose),
+            )
+    except:
+        pdb.set_trace()
+    pool.close()
+    pool.join()
+    
+    ls_df_rppls = []
+    ls_df_spndls = []
+
+    for i, val in results.items():
+        res_i = val.get()
+        ls_df_rppls.append(res_i[0])
+        ls_df_spndls.append(res_i[1])
+
+    if concat_results:
+        df_rppls = pd.concat(ls_df_rppls, ignore_index=True, sort=False)
+        df_spndls = pd.concat(ls_df_spndls, ignore_index=True, sort=False)
+
+        return df_rppls, df_spndls
+    else:
+        return ls_df_rppls, ls_df_spndls
+
+
+def event_detection_wrapper(
+        row, params_ripples, params_spindles, verbose=False):
+    """
+    Wrapper function around event detection to allow for multiprocessing
+    """
+    fname = row['fname']
+
+    f = File(fname)
+    lfp_hpc = f.analog_signals[0]
+    lfp_ctx = f.analog_signals[1]
+
+    df_rppls_i = event_detection(
+        lfp_hpc.signal.magnitude,
+        lfp_hpc.sample_rate.magnitude,
+        **params_ripples)
+
+    df_spndls_i = event_detection(
+        lfp_ctx.signal.magnitude,
+        lfp_ctx.sample_rate.magnitude,
+        **params_spindles)
+
+    assert params_ripples['t_excl_edge'] == params_spindles['t_excl_edge']
+    # merge with df_fnames
+    d = row.to_dict()
+    df_fnames_i = pd.DataFrame({k: [v] for k, v in d.items()})
+    df_fnames_i['tmp'] = 1
+
+    # assign duration of recording
+    duration = f.attrs['duration']
+    # compensate for cutted edges
+    duration = duration - 2*params_ripples['t_excl_edge']
+    df_fnames_i['duration'] = duration
+
+    df_rppls_i['tmp'] = 1
+    df_rppls_i = pd.merge(df_fnames_i, df_rppls_i, on=['tmp'])
+    df_rppls_i.drop('tmp', axis=1, inplace=True)
+
+    df_spndls_i['tmp'] = 1
+    df_spndls_i = pd.merge(df_fnames_i, df_spndls_i, on=['tmp'])
+    df_spndls_i.drop('tmp', axis=1, inplace=True)
+    if verbose:
+        print(
+            'Finished event detection for animal '+row['id']+
+            ', date '+str(row['date'])+
+            ', session '+str(row['session']))
+        print('\n')
+    return df_rppls_i, df_spndls_i
+
+
+def get_events_with_zero_change(
+        x, tol=10e-10, return_values=False, minimum_duration=0):
+    """
+    Returns list of start and ends of events where change smaller tol
+    can be detected in relation to previous value.
+    Values of these events can returned.
+    
+    Parameters
+    ----------
+    x : ndarray, shape (n,)
+    tol : float
+        Tolerance for considering values to not change
+    return_values : boolean
+    minimum_duration : int
+        Minimal duration of events to be considered
+
+    Returns
+    ---------
+    start_end: ndarray, shape (n_segments, 2)
+    vals: ndarray, shape (n_segments,)
+
+    """
+    
+    diff = np.diff(x, prepend=tol+1)  # prepend one value
+    # to account for shorter diff result
+
+    diff_bool = np.abs(diff) <= tol
+
+    start_end = rd.core.segment_boolean_series(
+        pd.Series(diff_bool), minimum_duration=minimum_duration)
+    start_end = np.array(start_end)
+
+    if return_values:
+        vals = x[start_end[:, 0]]
+        assert np.allclose(vals, x[start_end[:, 1]], tol)
+        return start_end, vals
+    else:
+        return start_end
+
+
+def detect_maxmin_reaches(x, vmin=None, vmax=None, tol=10e-10, len_seg_min=0):
+    """
+    Detect segments where signal hits the positive or negative end of the
+    recording range
+    
+    Params
+    ----------
+    x : ndarray, shape (n,)
+    vmin : u
+        if None, then maximal signal of data will be taken
+    vmax : maximal value to look for
+        if None, then maximal signal of data will be taken
+    tol : float
+        tolerance for how close values subsequent can be before
+        they will be considered constant
+    len_seg_min : int
+        Minimal length of segments
+
+    Returns
+    -------
+    start_end: ndarray, shape (n_segments, 2)
+
+    """
+    if not vmin:
+        vmin = np.min(x)
+    if not vmax:
+        vmax = np.max(x)
+
+    # find values close to edge
+    bool_close_vmin = np.abs(x - vmin) <= tol
+    bool_close_vmax = np.abs(x - vmax) <= tol
+    bool_close = np.logical_or(bool_close_vmin, bool_close_vmax)
+
+    # detect segments
+    start_end = rd.core.segment_boolean_series(
+        pd.Series(bool_close), minimum_duration=len_seg_min)
+    start_end = np.array(start_end)
+    
+    return start_end
+    
+
+# def detect_maxmin_reaches(
+#         df, n_cons_steps, tol):
+#     """
+#     Detect events where signal reaches the border of the recording range
+    
+#     Params
+#     ----------
+#     df : pandas.DataFrame
+    
+    
+#     """
+    
+#     for index, row in df_info.iterrows():
+#         fname = row['fname']
+#         f = File(fname)
+#         lfp = {
+#             'hpc': f.analog_signals[0].signal.magnitude,  # hippocampal signal
+#             'ctx': f.analog_signals[1].signal.magnitude,  # cortex signal
+#         }
+
+#         for key, lfp_i in lfp.items():
+#             vmin = row[key + '_rec_min']
+#             vmax = row[key + '_rec_max']
+
+#             # find values close to edge
+#             bool_close_vmin = np.abs(lfp_i - vmin) <= tol
+#             bool_close_vmax = np.abs(lfp_i - vmax) <= tol
+#             bool_close = np.logical_or(bool_close_vmin, bool_close_vmax)
+
+#             # detect segments
+#             start_end = rd.core.segment_boolean_series(
+#                 pd.Series(bool_close), minimum_duration=n_cons_steps)
+#             start_end = np.array(start_end)
