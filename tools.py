@@ -484,36 +484,79 @@ def detect_maxmin_reaches(x, vmin=None, vmax=None, tol=10e-10, len_seg_min=0):
     return start_end
     
 
-# def detect_maxmin_reaches(
-#         df, n_cons_steps, tol):
-#     """
-#     Detect events where signal reaches the border of the recording range
-    
-#     Params
-#     ----------
-#     df : pandas.DataFrame
-    
-    
-#     """
-    
-#     for index, row in df_info.iterrows():
-#         fname = row['fname']
-#         f = File(fname)
-#         lfp = {
-#             'hpc': f.analog_signals[0].signal.magnitude,  # hippocampal signal
-#             'ctx': f.analog_signals[1].signal.magnitude,  # cortex signal
-#         }
+def detect_maxmin_reaches_mp(
+        df_info,
+        params,
+        verbose=True
+        ):
+    """
+    noise detection with multiprocessing
+    """
 
-#         for key, lfp_i in lfp.items():
-#             vmin = row[key + '_rec_min']
-#             vmax = row[key + '_rec_max']
+    results = {}
 
-#             # find values close to edge
-#             bool_close_vmin = np.abs(lfp_i - vmin) <= tol
-#             bool_close_vmax = np.abs(lfp_i - vmax) <= tol
-#             bool_close = np.logical_or(bool_close_vmin, bool_close_vmax)
+    pool = mp.Pool(mp.cpu_count()-1)
 
-#             # detect segments
-#             start_end = rd.core.segment_boolean_series(
-#                 pd.Series(bool_close), minimum_duration=n_cons_steps)
-#             start_end = np.array(start_end)
+    for index, row in df_info.iterrows():
+        results[index] = pool.apply_async(
+            detect_maxmin_reaches_wrapper,
+            args=(row, params, verbose),
+        )
+        
+    pool.close()
+    pool.join()
+
+    ls_df_res = []
+    for i, val in results.items():
+        res_i = val.get()
+        res_i = pd.DataFrame(res_i).transpose()
+        ls_df_res.append(res_i)
+        
+    df_res = pd.concat(ls_df_res, ignore_index=True, sort=False)
+    return df_res
+
+
+def detect_maxmin_reaches_wrapper(
+        row, params, verbose=True):
+    """
+    Wrapper function around event detection to allow for multiprocessing
+    """
+    fname = row['fname']
+
+    f = File(fname)
+    lfp = {
+        'hpc': f.analog_signals[0].signal.magnitude,  # hippocampal signal
+        'ctx': f.analog_signals[1].signal.magnitude,  # cortex signal
+    }
+    hpc_sampling_rate = f.analog_signals[0].sample_rate.magnitude
+    ctx_sampling_rate = f.analog_signals[1].sample_rate.magnitude
+    assert hpc_sampling_rate == ctx_sampling_rate
+    sampling_interval = 1./hpc_sampling_rate
+    t_stop = len(lfp['hpc'])*sampling_interval
+    t = np.arange(0, t_stop, sampling_interval)
+    
+    for key, lfp_i in lfp.items():
+        vmin = row[key + '_rec_min']
+        vmax = row[key + '_rec_max']
+
+        start_end = detect_maxmin_reaches(
+            lfp_i, vmin=vmin, vmax=vmax, **params)
+        
+        # convert from pos to time
+        if len(start_end) > 0:
+            start_end_t = np.vstack([
+                [t[a[0]], t[a[1]]]
+                for a in start_end])
+        else:
+            start_end_t = None
+            
+        row[key + '_' + 'maxmin_reaches'] = start_end_t
+
+    if verbose:
+        print(
+            'Finished detection of maxmin reaches for animal ' + row['id'] +
+            ', date ' + str(row['date']) +
+            ', session '+str(row['session']))
+        print('\n')
+        
+    return row
